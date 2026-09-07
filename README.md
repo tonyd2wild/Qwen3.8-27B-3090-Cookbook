@@ -104,3 +104,20 @@ deployability, token efficiency, decode tok/s, per model × cluster.
 
 *Recipes are independent and stay live; this cookbook is just the front door. Corrections and
 your own numbers welcome as issues on the individual repos.*
+
+## 2026-09-07: KV pool ladder on the TP2 + DFlash2 lane (+21.6%, one change per boot)
+
+The live lane (2x RTX 3090 NVLink pair, vLLM v0.27.1, club-3090 DFlash2 backport, 7 draft tokens, fp8 e4m3 KV, 262,144 max-model-len, 6 seats, 1 MP image cap, prefix caching on) started the day at gmu 0.85 with a **324,240-token pool (1.24x at 262K)**. Two research passes (`research/`) found that Qwen3.8-27B is a hybrid (48 Gated DeltaNet + 16 full-attention layers, DeltaNet state pinned to fp32 by the checkpoint), that the profiled activation peak was 1.81 GiB at an 8192-token chunk, and that the lane had 2.8 GiB idle. Each step below is one change on top of the previous one, relaunched through the lane's own compose project (`q27b-dflash2`, `compose/dual/autoround-int4/dflash2.yml` plus an override), health-checked, and probed with a real completion.
+
+| Step | Change | Pool at 262K | Delta | Worker print (per card) | Checks |
+|---|---|---:|---:|---|---|
+| baseline | gmu 0.85, chunk 8192 | 324,240 (1.24x) | | KV 7.23 GiB, peak 1.19 (older boot) | |
+| A1 | gmu 0.90 | 349,290 (1.33x) | +7.7% | consumed 11.61, peak 1.81, graphs 0.49, KV 7.78, idle 1.8 GiB | completion OK |
+| A2 | max-num-batched-tokens 4096 | 369,061 (1.41x) | +5.7% | peak 1.81 to 1.50, KV 8.17 | completion OK |
+| A3 | `--mamba-ssm-cache-dtype bfloat16` | **394,126 (1.50x)** | +6.8% | unchanged print, block geometry halves | needle correct at 199,584 prompt tokens (TTFT 196 s, ~1,000 tok/s prefill); count-to-100 279 tok/s, prose 64 |
+
+Parked at A3 (Tony's call); A4 = gmu 0.92 is staged and estimated at another +25K with about 1.4 GiB idle. The A3 command list is now the lane's canonical override. Each relaunch takes about 5 minutes because the club entrypoint re-applies its patches.
+
+What the audit says is left, in order: a W4A16 drafter instead of the BF16 DFlash2 draft (about 1.8 GiB per card today, est. +50K, needs a verified download), `--language-model-only` (+36K to 45K, but no image caps on this lane), and TP4 on all four cards (1,003,062 measured 2026-08-20, the only lever that triples the pool). Not worth it here: `--kv-cache-memory-bytes` (net of the graph reserve at v0.27.1, same as the nightly), fewer draft tokens (acceptance is the whole point of DFlash2), prefix caching off (80 MB per seat, 7x TTFT cost), fp8 KV variants (already at the Ampere floor), PP 2x2 (breaks the drafter's embedding sharing).
+
+Caveats: the prose number has no same-method reading of this lane from before the ladder, and DFlash2 accepts poorly on free prose, so treat 64 tok/s as this lane's prose speed rather than a regression until measured against the old config. The bf16 DeltaNet state passed one 200K needle; it is not a full quality equivalence test. One failed attempt earlier in the morning used the wrong compose folder and took the lane down for 26 minutes; the fix was to launch through the project the live container was born from.
